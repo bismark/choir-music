@@ -15,7 +15,7 @@ scans/<piece>/score.pdf
 ## 2. Read the scan into notes (decomposer)
 
 ```
-~/Applications/decomposer/bin/decomposer convert scans/<piece> --title "<Title>"
+vendor/decomposer/bin/decomposer convert scans/<piece> --title "<Title>"
 ```
 
 This writes `scans/<piece>/<Title>.musicxml`. Run it yourself in a terminal (or `! ...` in Claude Code).
@@ -23,12 +23,13 @@ This writes `scans/<piece>/<Title>.musicxml`. Run it yourself in a terminal (or 
 Other decomposer commands:
 
 ```
-~/Applications/decomposer/bin/decomposer inspect scans/<piece>                     # page order + contact sheet
-~/Applications/decomposer/bin/decomposer render  "scans/<piece>/<Title>.musicxml"  # engrave it to compare with the scan
+vendor/decomposer/bin/decomposer inspect scans/<piece>                     # page order + contact sheet
+vendor/decomposer/bin/decomposer render  "scans/<piece>/<Title>.musicxml"  # engrave it to compare with the scan
 ```
 
-Our copy of decomposer is locally patched (`patches/copisteria.patch` in the decomposer folder) so it
-doesn't drop bars. If you reinstall it, re-apply that patch.
+decomposer is a git submodule at `vendor/decomposer`, tracking our fork
+(https://github.com/bismark/decomposer, branch `choir-music`, forked from dfhants/decomposer) which
+carries the fixes that stop it dropping bars. Bump it with `git -C vendor/decomposer pull` then commit.
 
 ## 3. Check nothing was dropped
 
@@ -141,4 +142,4 @@ uv run tools/render.py "out/Come Ye Thankful People Come - full mix" \
 - `brew install fluidsynth ffmpeg`
 - Soundfont: `~/Library/Audio/Sounds/Banks/GeneralUser-GS.sf2`
 - Python deps: `uv sync` (from `pyproject.toml`; `uv run` also does this automatically)
-- decomposer: `~/Applications/decomposer` (`bin/decomposer setup` once after installing, then re-apply `patches/copisteria.patch`)
+- decomposer: `git clone --recurse-submodules` (or `git submodule update --init` in an existing clone), then `vendor/decomposer/bin/decomposer setup` once
