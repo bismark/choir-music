@@ -1,0 +1,4 @@
+[submodule "vendor/decomposer"]
+	path = vendor/decomposer
+	url = https://github.com/bismark/decomposer
+	branch = choir-music
