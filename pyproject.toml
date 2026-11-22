@@ -1,0 +1,9 @@
+[project]
+name = "choir-music"
+version = "0.1.0"
+description = "Choir score scans -> rehearsal audio"
+requires-python = ">=3.12"
+dependencies = ["music21", "mido"]
+
+[tool.uv]
+package = false

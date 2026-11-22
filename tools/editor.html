@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Score Editor</title>
+<style>
+  :root {
+    --bg: #fbfaf7; --panel: #fff; --ink: #222; --muted: #888; --rule: #ddd; --sel: #ffd54f;
+    --S: #c0392b; --A: #c27c0e; --T: #1e8449; --B: #2471a3; --Piano: #6b6f76;
+  }
+  body { margin: 0; font: 14px -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  header { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+           padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--rule); }
+  header .title { font-weight: 600; margin-right: auto; }
+  button, select, input { font: inherit; }
+  button { padding: 3px 10px; border: 1px solid #bbb; border-radius: 5px; background: #fff; cursor: pointer; }
+  button.on { background: #333; border-color: #333; color: #fff; }
+  #save.dirty { background: #c0392b; border-color: #c0392b; color: #fff; }
+  #score { padding: 4px 16px 0; }
+  #score svg { display: block; width: 100%; user-select: none; touch-action: none; }
+  body.editing [data-i] { cursor: ns-resize; }
+  .gap rect { fill: #e67e2212; stroke: #e67e22; stroke-dasharray: 4 3; }
+  .gap text { fill: #e67e22; font-size: 18px; }
+  body.editing .gap { cursor: copy; }
+  body.editing .gap rect { fill: #e67e2230; }
+  [data-i] { cursor: pointer; }
+  #status { padding: 4px 16px; min-height: 1.4em; color: #444; }
+  .help { padding: 0 16px 10px; color: var(--muted); font-size: 12px; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid #ccc; border-radius: 3px; padding: 0 3px; }
+  main { display: flex; align-items: flex-start; }
+  #left { flex: 1 1 0; min-width: 0; }
+  #scan { flex: 0 0 48%; position: sticky; top: var(--hdr, 45px); height: calc(100vh - var(--hdr, 45px));
+          border: 0; border-left: 1px solid var(--rule); }
+  #scan[hidden] { display: none; }
+  @media (max-width: 900px) {
+    main { display: block; }
+    #scan { display: block; width: 100%; height: 80vh; position: static; border-left: 0; border-top: 1px solid var(--rule); }
+    #scan[hidden] { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="title" id="title">Loading…</span>
+  <button id="prev" title="Previous bar (←)">◀</button>
+  <span>bar <input id="bar" size="3"> <span id="barOf"></span></span>
+  <button id="next" title="Next bar (→)">▶</button>
+  <select id="count" title="Bars shown (1/2/3)">
+    <option value="1">1 bar</option><option value="2" selected>2 bars</option><option value="3">3 bars</option>
+  </select>
+  <button id="play" title="Play these bars (space)">Play</button>
+  <select id="solo" title="Voice to bring out"><option value="">all voices</option></select>
+  <label>♩ = <input id="bpm" size="3" value="90"></label>
+  <label title="Keep playing and turn the bars (F)"><input type="checkbox" id="follow" checked> follow</label>
+  <button id="edit" title="Edit mode (E)">Edit</button>
+  <button id="undo" title="Undo (⌘Z)">Undo</button>
+  <button id="save" title="Save (⌘S)">Save</button>
+  <button id="scanBtn" hidden>Scan</button>
+</header>
+<main>
+<div id="left">
+<div id="score"></div>
+<div id="status"></div>
+<div class="help">
+  <kbd>←</kbd><kbd>→</kbd> bars · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> bars shown · click a note to hear it · in edit mode click an orange gap to add a note ·
+  <kbd>Tab</kbd> next note · <kbd>E</kbd> edit mode, then drag a note or <kbd>↑</kbd><kbd>↓</kbd> (in key),
+  <kbd>⇧↑</kbd><kbd>⇧↓</kbd> semitone · <kbd>⌘Z</kbd> undo · <kbd>⌘S</kbd> save · <kbd>space</kbd> play · <kbd>F</kbd> follow (play on and turn the bars)
+</div>
+</div>
+<iframe id="scan" hidden></iframe>
+</main>
+
+<script>
+const STEPS = 'CDEFGAB', PC = [0, 2, 4, 5, 7, 9, 11];
+const SHARPS = 'FCGDAEB', FLATS = 'BEADGCF';
+const FLAGS = {eighth: 1, '16th': 2, '32nd': 3, '64th': 4};
+const ACC = {'-2': '𝄫', '-1': '♭', 0: '♮', 1: '♯', 2: '𝄪'};
+const SP = 10, HS = SP / 2, LEFT = 120, RIGHT = 12, TOP = 6 * SP, ROW_H = 15 * SP, PAD = 2.6 * SP;
+const $ = id => document.getElementById(id);
+
+let doc, rows = [], measures = [], notes = [], gaps = [];
+let start = 0, count = 2, editing = false, sel = null, dirty = false, layout = null, drag = null;
+const undoStack = [];
+
+// ---------- MusicXML -> model ----------
+const kids = (el, name) => [...el.children].filter(c => c.tagName === name);
+const kid = (el, name) => kids(el, name)[0];
+const txt = (el, name, d) => { const k = el && kid(el, name); return k ? k.textContent.trim() : d; };
+const mod7 = x => ((x % 7) + 7) % 7;
+const dpOf = n => n.octave * 7 + STEPS.indexOf(n.step);            // diatonic position
+const midiOf = n => 12 * (n.octave + 1) + PC[STEPS.indexOf(n.step)] + n.alter;
+const color = part => `var(--${part})`;
+
+function keyAlter(fifths, step) {
+  if (fifths > 0 && SHARPS.slice(0, fifths).includes(step)) return 1;
+  if (fifths < 0 && FLATS.slice(0, -fifths).includes(step)) return -1;
+  return 0;
+}
+
+function clefBottom(c) {  // diatonic position of the bottom staff line
+  const base = c.sign === 'F' ? 24 : c.sign === 'C' ? 28 : 32;  // F3, C4, G4
+  return base - 2 * (c.line - 1) + 7 * c.oct;
+}
+
+function build() {
+  rows = []; measures = []; notes = []; gaps = [];
+  const names = {};
+  for (const sp of doc.getElementsByTagName('score-part')) names[sp.getAttribute('id')] = txt(sp, 'part-name', '');
+  kids(doc.documentElement, 'part').forEach((p, pi) => {
+    const staves = Math.max(1, ...[...p.getElementsByTagName('staves')].map(s => +s.textContent));
+    const prow = [];
+    for (let s = 1; s <= staves; s++) {
+      const r = {idx: rows.length, staff: s, piano: staves > 1, clef: [], fifths: []};
+      prow.push(r); rows.push(r);
+    }
+    const clefs = prow.map((_, k) => k ? {sign: 'F', line: 4, oct: 0} : {sign: 'G', line: 2, oct: 0});
+    let div = 1, fifths = 0, len = 4, page = 1;
+    kids(p, 'measure').forEach((m, i) => {
+      measures[i] ??= {number: m.getAttribute('number'), len: 0, page: 1};
+      let cur = 0, last = 0, end = 0;
+      for (const c of m.children) {
+        const dur = +txt(c, 'duration', 0) / div;
+        if (c.tagName === 'print' && c.getAttribute('new-page') === 'yes') page++;
+        else if (c.tagName === 'attributes') {
+          div = +txt(c, 'divisions', div);
+          const k = kid(c, 'key'); if (k) fifths = +txt(k, 'fifths', 0);
+          const t = kid(c, 'time'); if (t) len = 4 * txt(t, 'beats', 4) / txt(t, 'beat-type', 4);
+          for (const cl of kids(c, 'clef')) {
+            const s = +(cl.getAttribute('number') || 1);
+            if (clefs[s - 1]) clefs[s - 1] = {sign: txt(cl, 'sign', 'G'), line: +txt(cl, 'line', 2), oct: +txt(cl, 'clef-octave-change', 0)};
+          }
+        }
+        else if (c.tagName === 'backup') cur -= dur;
+        else if (c.tagName === 'forward') {
+          // OMR writes <forward> where it lost a note; shown as a fillable gap
+          if (dur > 0) gaps.push({el: c, row: prow[+txt(c, 'staff', 1) - 1] || prow[0], m: i, on: cur, dur, div, k: gaps.length});
+          cur += dur;
+        }
+        else if (c.tagName === 'note') {
+          const grace = !!kid(c, 'grace');
+          if (!kid(c, 'chord')) { last = cur; if (!grace) cur += dur; }
+          const pitch = kid(c, 'pitch'), staff = +txt(c, 'staff', 1);
+          const n = {
+            el: c, row: prow[staff - 1] || prow[0], m: i, on: last, dur: grace ? 0 : dur,
+            type: txt(c, 'type', 'quarter'), dots: kids(c, 'dot').length, rest: !pitch, voice: txt(c, 'voice', '1'),
+            tieStart: kids(c, 'tie').some(t => t.getAttribute('type') === 'start'),
+          };
+          if (pitch) Object.assign(n, {step: txt(pitch, 'step', 'C'), alter: +txt(pitch, 'alter', 0), octave: +txt(pitch, 'octave', 4)});
+          n.i = notes.length; notes.push(n);
+        }
+        end = Math.max(end, cur);
+      }
+      prow.forEach((r, k) => { r.clef[i] = {...clefs[k]}; r.fifths[i] = fifths; });
+      if (pi === 0) measures[i].page = page;
+      // a pickup (implicit) bar is as long as what is in it, not the time signature
+      measures[i].len = Math.max(measures[i].len, end, m.getAttribute('implicit') === 'yes' ? 0 : len);
+    });
+  });
+
+  let at = 0;
+  for (const m of measures) { m.at = at; at += m.len; }
+  for (const n of notes) n.abs = measures[n.m].at + n.on;
+  // A blank in one voice under a chord the other voice holds (two parts sharing a stem) is not a lost note.
+  gaps = gaps.filter(g => notes.filter(n => n.row === g.row && n.m === g.m && !n.rest &&
+    n.on <= g.on + 1e-6 && n.on + n.dur >= g.on + g.dur - 1e-6).length < 2);
+  gaps.forEach((g, k) => { g.k = k; g.abs = measures[g.m].at + g.on; });
+  for (const n of notes) if (n.tieStart && !n.rest) {
+    const o = notes.find(o => o.row === n.row && !o.rest && Math.abs(o.abs - n.abs - n.dur) < 1e-6 && midiOf(o) === midiOf(n));
+    if (o) { n.tieNext = o; o.tiePrev = n; }
+  }
+
+  // Choir staves carry two voices each (top note = upper voice), like render.py.
+  const choir = rows.filter(r => !r.piano);
+  for (const r of rows) {
+    const k = choir.indexOf(r);
+    r.voices = k < 0 ? ['Piano'] : choir.length >= 3 ? ['SATB'[k] ?? 'B'] : [['S', 'A'], ['T', 'B']][k] ?? ['T', 'B'];
+  }
+  assignVoices();
+  const parts = [...new Set(rows.flatMap(r => r.voices))], solo = $('solo').value;
+  $('solo').innerHTML = '<option value="">all voices</option>' + parts.map(p => `<option>${p}</option>`).join('');
+  $('solo').value = solo;
+}
+
+function assignVoices() {
+  const groups = new Map();
+  for (const n of notes) if (!n.rest) {
+    const k = `${n.row.idx}|${n.abs}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(n);
+  }
+  for (const g of [...groups.values()].sort((a, b) => a[0].abs - b[0].abs)) {
+    const vs = g[0].row.voices, n = g[0];
+    g.sort((a, b) => midiOf(b) - midiOf(a));
+    g.forEach((n, k) => n.part = vs.length > 1 && k > 0 && k === g.length - 1 ? vs[1] : vs[0]);
+    if (g.length > 1 || vs.length < 2) continue;
+    // a lone note: a tie continues its part; under (over) a note still held it is the lower (upper) voice
+    const held = notes.filter(o => o.row === n.row && !o.rest && o.abs < n.abs && o.abs + o.dur > n.abs + 1e-6);
+    // (a unison with the held note goes by voice number, voice 1 being the upper part, as in render.py)
+    const below = o => midiOf(o) > midiOf(n) || (midiOf(o) === midiOf(n) && +o.voice < +n.voice);
+    const above = o => midiOf(o) < midiOf(n) || (midiOf(o) === midiOf(n) && +o.voice > +n.voice);
+    if (n.tiePrev) n.part = n.tiePrev.part;
+    else if (held.length && held.every(below)) n.part = vs[1];
+    else if (held.length && held.every(above)) n.part = vs[0];
+  }
+}
+
+// ---------- drawing ----------
+function visible() {
+  const v = [];
+  for (let i = start; i < Math.min(start + count, measures.length); i++) v.push(i);
+  return v;
+}
+
+function render() {
+  const W = Math.max(400, $('score').clientWidth - 32), vis = visible();
+  const mw = (W - LEFT - RIGHT) / vis.length;
+  // a key change after the first bar shown is drawn at the start of its bar, so the notes move over
+  const changes = new Map(vis.slice(1).map(m => [m, keyChange(m)]).filter(([, c]) => c));
+  const extra = m => changes.has(m) ? (changes.get(m).length + 1) * 0.85 * SP : 0;
+  const xAt = (m, on) => LEFT + vis.indexOf(m) * mw + PAD + extra(m) + (on / measures[m].len) * (mw - PAD - SP - extra(m));
+  layout = {vis, mw, xAt};
+  const H = TOP + rows.length * ROW_H - 2 * SP;
+  const o = [];
+  const line = (x1, y1, x2, y2, w = 1, c = 'var(--ink)') =>
+    o.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="${w}"/>`);
+
+  vis.forEach((m, j) => o.push(`<text x="${LEFT + j * mw + 2}" y="16" font-size="12" fill="var(--muted)">${measures[m].number}</text>`));
+
+  for (const r of rows) {
+    const y0 = TOP + r.idx * ROW_H, yb = y0 + 4 * SP;
+    const clef = r.clef[start], fifths = r.fifths[start], bot = clefBottom(clef);
+    const yOf = dp => yb - (dp - bot) * HS;
+    const label = r.voices.map(v => `<tspan fill="${color(v)}">${v}</tspan>`).join('<tspan fill="var(--muted)">/</tspan>');
+    o.push(`<text x="0" y="${y0 + 2 * SP + 5}" font-size="15" font-weight="600">${label}</text>`);
+    for (let k = 0; k < 5; k++) line(44, y0 + k * SP, W - RIGHT, y0 + k * SP, 1, '#999');
+    line(44, y0, 44, yb, 1.2);
+    for (let j = 1; j <= vis.length; j++) line(LEFT + j * mw, y0, LEFT + j * mw, yb, 1.2);
+
+    // clef and key signature
+    const glyph = clef.sign === 'F' ? '𝄢' : clef.sign === 'C' ? '𝄡' : '𝄞';
+    const clefY = clef.sign === 'F' ? yb - 2 * SP - 1 : clef.sign === 'C' ? yb - 1.5 * SP : yb - 0.5 * SP;
+    o.push(`<text x="48" y="${clefY}" font-size="${clef.sign === 'F' ? 3.4 * SP : 4 * SP}" font-family="Apple Symbols, Noto Music, serif">${glyph}</text>`);
+    const shift = clef.sign === 'F' ? -2 : clef.sign === 'C' ? -1 : 0;
+    sigGlyphs(fifths).forEach((g, k) => accidental(o, 76 + k * 0.85 * SP, yb - (g.pos + shift) * HS, g.alter, 'var(--ink)'));
+    for (const [m, glyphs] of changes) {
+      const bx = LEFT + vis.indexOf(m) * mw;
+      line(bx - 3, y0, bx - 3, yb, 1.2);         // double bar before the new key
+      glyphs.forEach((g, k) => accidental(o, bx + 0.8 * SP + k * 0.85 * SP, yb - (g.pos + shift) * HS, g.alter, 'var(--ink)'));
+    }
+
+    const mine = notes.filter(n => n.row === r && vis.includes(n.m));
+
+    // accidentals shown when they differ from the key or an earlier note in the bar
+    for (const m of vis) {
+      const state = new Map();
+      for (const n of mine.filter(n => n.m === m && !n.rest).sort((a, b) => a.on - b.on)) {
+        const key = n.step + n.octave, cur = state.has(key) ? state.get(key) : keyAlter(r.fifths[m], n.step);
+        n.showAcc = n.alter !== cur && !(n.tiePrev && n.tiePrev.m === m);
+        state.set(key, n.alter);
+      }
+    }
+
+    // stem groups: same onset and voice
+    const groups = new Map();
+    for (const n of mine) if (!n.rest) {
+      const k = `${n.m}|${n.on}|${n.voice}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(n);
+    }
+    const multiVoice = new Set(vis.filter(m => new Set(mine.filter(n => n.m === m && !n.rest).map(n => n.voice)).size > 1));
+    const mid = bot + 4;
+
+    // a voice sharing a pitch with another voice at the same moment (a unison) is drawn beside it, not on top
+    const taken = new Set(), offset = new Map();
+    for (const g of groups.values()) {
+      const at = n => `${n.m}|${n.on}|${dpOf(n)}`;
+      if (g.some(n => taken.has(at(n)))) offset.set(g, 1.5 * SP);
+      g.forEach(n => taken.add(at(n)));
+    }
+
+    for (const g of groups.values()) {
+      const {m, on, voice, type} = g[0];
+      const x = xAt(m, on) + (offset.get(g) || 0);
+      const up = multiVoice.has(m) ? +voice % 2 === 1 : g.reduce((s, n) => s + dpOf(n), 0) / g.length < mid;
+      const sorted = [...g].sort((a, b) => up ? dpOf(a) - dpOf(b) : dpOf(b) - dpOf(a));
+      const hw = type === 'whole' ? 0.8 * SP : 0.62 * SP;
+      let prev = null, prevShifted = false;
+      for (const n of sorted) {
+        const shifted = prev && Math.abs(dpOf(n) - dpOf(prev)) === 1 && !prevShifted;
+        n.x = x + (shifted ? (up ? 2 : -2) * hw : 0);
+        prev = n; prevShifted = shifted;
+      }
+      // ledger lines
+      for (const n of g) {
+        const dp = dpOf(n);
+        for (let d = bot - 2; d >= dp; d -= 2) line(n.x - hw - 3, yOf(d), n.x + hw + 3, yOf(d), 1.2);
+        for (let d = bot + 10; d <= dp; d += 2) line(n.x - hw - 3, yOf(d), n.x + hw + 3, yOf(d), 1.2);
+      }
+      // stem and flags
+      if (type !== 'whole' && type !== 'breve') {
+        const same = new Set(g.map(n => n.part)).size === 1 ? color(g[0].part) : 'var(--ink)';
+        const ys = g.map(n => yOf(dpOf(n)));
+        const sx = up ? x + hw - 0.6 : x - hw + 0.6;
+        const from = up ? Math.max(...ys) : Math.min(...ys);
+        const tip = up ? Math.min(...ys) - 3.5 * SP : Math.max(...ys) + 3.5 * SP;
+        line(sx, from, sx, tip, 1.3, same);
+        const s = up ? 1 : -1;
+        for (let f = 0; f < (FLAGS[type] || 0); f++) {
+          const ty = tip + f * 0.8 * SP * s;
+          o.push(`<path d="M${sx},${ty} c${0.2 * SP},${0.9 * SP * s} ${1.1 * SP},${1.0 * SP * s} ${0.8 * SP},${2.2 * SP * s}" fill="none" stroke="${same}" stroke-width="1.6"/>`);
+        }
+      }
+      // heads
+      for (const n of g) {
+        const y = yOf(dpOf(n)), c = color(n.part), hollow = ['half', 'whole', 'breve'].includes(type);
+        o.push(`<g data-i="${n.i}">`);
+        if (n === sel) o.push(`<circle cx="${n.x}" cy="${y}" r="${1.3 * SP}" fill="var(--sel)" opacity=".7"/>`);
+        o.push(`<rect x="${n.x - hw - 2}" y="${y - HS}" width="${2 * hw + 4}" height="${SP}" fill="transparent"/>`);
+        o.push(`<ellipse cx="${n.x}" cy="${y}" rx="${hw}" ry="${0.42 * SP}" transform="rotate(${type === 'whole' ? 0 : -20} ${n.x} ${y})"
+                 fill="${hollow ? 'none' : c}" stroke="${c}" stroke-width="${hollow ? 2 : 1}"/>`);
+        if (n.showAcc) accidental(o, n.x - hw - 0.75 * SP, y, n.alter, c);
+        for (let d = 0; d < n.dots; d++)
+          o.push(`<circle cx="${n.x + hw + 0.5 * SP + d * 0.5 * SP}" cy="${(dpOf(n) - bot) % 2 === 0 ? y - HS : y}" r="1.7" fill="${c}"/>`);
+        o.push('</g>');
+        // tie to the next note (or off the right edge)
+        if (n.tieNext) {
+          const t = n.tieNext, s = dpOf(n) >= mid ? -1 : 1;
+          const x2 = vis.includes(t.m) ? xAt(t.m, t.on) - hw : W - RIGHT;
+          o.push(`<path d="M${n.x + hw},${y + s * HS} Q${(n.x + x2) / 2},${y + s * 1.6 * SP} ${x2},${y + s * HS}" fill="none" stroke="${c}" stroke-width="1.3"/>`);
+        }
+      }
+    }
+
+    for (const n of mine.filter(n => n.rest && !n.el.getAttribute('print-object'))) {
+      const x = xAt(n.m, n.on);
+      if (n.type === 'whole') o.push(`<rect x="${x - 6}" y="${y0 + SP}" width="12" height="${HS}" fill="var(--ink)"/>`);
+      else if (n.type === 'half') o.push(`<rect x="${x - 6}" y="${y0 + 2 * SP - HS}" width="12" height="${HS}" fill="var(--ink)"/>`);
+      else o.push(`<path d="M${x - 3},${y0 + 0.5 * SP} l6,${SP} l-6,${SP} l6,${SP}" fill="none" stroke="var(--ink)" stroke-width="2"/>`);
+    }
+
+    // gaps the OMR left empty: click one in edit mode to put a note there
+    for (const g of gaps.filter(g => g.row === r && vis.includes(g.m))) {
+      const x1 = xAt(g.m, g.on) - 0.8 * SP, x2 = Math.max(x1 + 2 * SP, xAt(g.m, g.on + g.dur) - 0.8 * SP);
+      o.push(`<g data-gap="${g.k}" class="gap"><rect x="${x1}" y="${y0 - SP}" width="${x2 - x1}" height="${6 * SP}" rx="4"/>
+              <text x="${(x1 + x2) / 2}" y="${y0 + 2 * SP + 6}" text-anchor="middle">+</text></g>`);
+    }
+  }
+  o.push(`<line id="playhead" x1="0" x2="0" y1="${TOP - 3 * SP}" y2="${H}" stroke="#e67e22" stroke-width="2" visibility="hidden"/>`);
+
+  $('score').innerHTML = `<svg viewBox="0 0 ${W} ${H}" height="${H}">${o.join('')}</svg>`;
+  $('bar').value = measures[start].number;
+  $('barOf').textContent = `of ${measures[measures.length - 1].number}`;
+  $('save').classList.toggle('dirty', dirty);
+  $('edit').classList.toggle('on', editing);
+  document.body.classList.toggle('editing', editing);
+  showStatus();
+  syncScan();
+}
+
+// key-signature glyphs as staff positions on a treble staff (0 = bottom line), sharps or flats in order
+function sigGlyphs(fifths) {
+  const order = fifths > 0 ? [8, 5, 9, 6, 3, 7, 4] : [4, 7, 3, 6, 2, 5, 1];
+  return order.slice(0, Math.abs(fifths)).map(pos => ({pos, alter: Math.sign(fifths)}));
+}
+
+// glyphs for a key change into bar m: naturals cancelling what the old key loses, then the new key; null if none
+function keyChange(m) {
+  const r = rows[0];
+  if (!r || !m || r.fifths[m] === r.fifths[m - 1]) return null;
+  const from = r.fifths[m - 1], to = r.fifths[m];
+  const kept = Math.sign(from) === Math.sign(to) ? Math.min(Math.abs(from), Math.abs(to)) : 0;
+  const cancel = sigGlyphs(from).slice(kept).map(g => ({pos: g.pos, alter: 0}));
+  return [...cancel, ...sigGlyphs(to)];
+}
+
+function accidental(o, x, y, alter, c) {
+  const dy = alter === -1 ? 0.35 * SP : alter === -2 ? 0.35 * SP : 0.55 * SP;
+  o.push(`<text x="${x}" y="${y + dy}" font-size="${1.9 * SP}" text-anchor="middle" fill="${c}" font-family="Apple Symbols, Noto Music, serif">${ACC[alter]}</text>`);
+}
+
+function noteName(n) {
+  return n.step + (n.alter ? ACC[n.alter] : '') + n.octave;
+}
+
+function showStatus(msg) {
+  if (msg) { $('status').textContent = msg; return; }
+  if (!sel) { $('status').textContent = editing ? 'Edit mode: drag a note up or down.' : ''; return; }
+  const beat = Math.round((1 + sel.on) * 100) / 100;
+  $('status').textContent = sel.rest ? `rest · bar ${measures[sel.m].number} beat ${beat}`
+    : `${sel.part} · bar ${measures[sel.m].number} beat ${beat} · ${noteName(sel)} · ${sel.type}${'.'.repeat(sel.dots)}`;
+}
+
+// ---------- editing ----------
+function tieGroup(n) {
+  let a = n; while (a.tiePrev) a = a.tiePrev;
+  const g = []; for (; a; a = a.tieNext) g.push(a);
+  return g;
+}
+
+function setPitch(n, step, alter, octave) {
+  Object.assign(n, {step, alter, octave});
+  const p = kid(n.el, 'pitch');
+  kid(p, 'step').textContent = step;
+  kid(p, 'octave').textContent = octave;
+  let a = kid(p, 'alter');
+  if (alter) {
+    if (!a) {
+      const oct = kid(p, 'octave'), ws = oct.previousSibling;
+      a = doc.createElement('alter');
+      p.insertBefore(a, oct);
+      if (ws?.nodeType === Node.TEXT_NODE) p.insertBefore(doc.createTextNode(ws.textContent), oct);
+    }
+    a.textContent = alter;
+  } else if (a) {
+    if (a.previousSibling?.nodeType === Node.TEXT_NODE) a.previousSibling.remove();
+    a.remove();
+  }
+  const acc = kid(n.el, 'accidental');
+  if (acc) {
+    if (acc.previousSibling?.nodeType === Node.TEXT_NODE) acc.previousSibling.remove();
+    acc.remove();
+  }
+}
+
+function change(n, pitch, record = true) {
+  const g = tieGroup(n);
+  if (record) undoStack.push(g.map(o => ({o, step: o.step, alter: o.alter, octave: o.octave})));
+  for (const o of g) setPitch(o, pitch.step, pitch.alter, pitch.octave);
+  dirty = true;
+  assignVoices();
+  beep(n);
+  render();
+}
+
+function diatonic(n, dp) {
+  const step = STEPS[mod7(dp)];
+  return {step, alter: keyAlter(n.row.fifths[n.m], step), octave: Math.floor(dp / 7)};
+}
+
+function chromatic(n, delta) {
+  const midi = midiOf(n) + delta, pc = ((midi % 12) + 12) % 12, fifths = n.row.fifths[n.m];
+  const spell = (k, alter) => ({step: STEPS[k], alter, octave: (midi - PC[k] - alter) / 12 - 1});
+  const tries = [k => keyAlter(fifths, STEPS[k]), () => 0, () => (delta > 0 ? 1 : -1), () => (delta > 0 ? -1 : 1)];
+  for (const t of tries) for (let k = 0; k < 7; k++) {
+    const a = t(k);
+    if ((PC[k] + a + 12) % 12 === pc) return spell(k, a);
+  }
+}
+
+function rebuild() {
+  const el = sel?.el;
+  build();
+  sel = notes.find(n => n.el === el) ?? null;
+}
+
+function undo() {
+  const last = undoStack.pop();
+  if (!last) return;
+  if (last.undo) last.undo();
+  else for (const {o, step, alter, octave} of last) setPitch(o, step, alter, octave);
+  dirty = true;
+  sel = last.undo ? null : last[0].o;
+  rebuild();
+  if (sel && !visible().includes(sel.m)) start = sel.m;
+  render();
+}
+
+// Largest plain or dotted note value that fits in q quarters and in whole divisions.
+function fit(q, div) {
+  for (const [type, base] of [['whole', 4], ['half', 2], ['quarter', 1], ['eighth', 0.5], ['16th', 0.25], ['32nd', 0.125]])
+    for (const dots of [2, 1, 0]) {
+      const len = base * (2 - 2 ** -dots);
+      if (len <= q + 1e-9 && Number.isInteger(len * div)) return {type, dots, len};
+    }
+}
+
+// Turn (the start of) an empty gap into a note, pitched like the note before it.
+function fillGap(g) {
+  const f = fit(g.dur, g.div);
+  if (!f) return null;
+  const prev = notes.filter(n => n.row === g.row && !n.rest && n.abs < g.abs + 1e-9)
+    .sort((a, b) => b.abs - a.abs || midiOf(b) - midiOf(a))[0];
+  const p = prev ?? {step: g.row.clef[g.m].sign === 'F' ? 'D' : 'B', alter: 0, octave: g.row.clef[g.m].sign === 'F' ? 3 : 4};
+  const ws = g.el.previousSibling?.nodeType === Node.TEXT_NODE ? g.el.previousSibling.textContent : '\n      ', i = ws + '  ';
+  const staff = kid(g.el, 'staff') ? txt(g.el, 'staff') : g.row.piano ? g.row.staff : '';
+  const xml = `<note>${i}<pitch>${i}  <step>${p.step}</step>${p.alter ? `${i}  <alter>${p.alter}</alter>` : ''}${i}  <octave>${p.octave}</octave>${i}</pitch>`
+    + `${i}<duration>${f.len * g.div}</duration>${i}<voice>${txt(g.el, 'voice', prev ? prev.voice : '1')}</voice>${i}<type>${f.type}</type>`
+    + `${i}<dot/>`.repeat(f.dots) + (staff ? `${i}<staff>${staff}</staff>` : '') + `${ws}</note>`;
+  const note = doc.importNode(new DOMParser().parseFromString(xml, 'application/xml').documentElement, true);
+  const durEl = kid(g.el, 'duration'), oldDur = durEl.textContent;
+  if (Math.abs(f.len - g.dur) < 1e-9) {
+    g.el.replaceWith(note);
+    undoStack.push({undo: () => note.replaceWith(g.el)});
+  } else {  // only part of the gap fits one note: keep the rest as a gap
+    const space = doc.createTextNode(ws);
+    g.el.before(note, space);
+    durEl.textContent = Math.round((g.dur - f.len) * g.div);
+    undoStack.push({undo: () => { note.remove(); space.remove(); durEl.textContent = oldDur; }});
+  }
+  dirty = true;
+  rebuild();
+  return notes.find(n => n.el === note);
+}
+
+async function save() {
+  const xml = new XMLSerializer().serializeToString(doc);
+  const r = await fetch('score.musicxml', {method: 'PUT', body: xml});
+  if (r.ok) { dirty = false; render(); showStatus('Saved.'); }
+  else showStatus('Save failed: ' + await r.text());
+}
+
+// ---------- sound ----------
+let ctx = null, playing = null;
+function audio() { return ctx ??= new AudioContext(); }
+
+function tone(midi, t, d, gain, wave = 'triangle') {
+  const a = audio(), osc = a.createOscillator(), g = a.createGain();
+  osc.type = wave;
+  osc.frequency.value = 440 * 2 ** ((midi - 69) / 12);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(gain, t + 0.02);
+  g.gain.setValueAtTime(gain, t + Math.max(0.03, d - 0.06));
+  g.gain.linearRampToValueAtTime(0, t + d);
+  osc.connect(g).connect(a.destination);
+  osc.start(t); osc.stop(t + d + 0.01);
+  return osc;
+}
+
+function beep(n) { if (!n.rest) tone(midiOf(n), audio().currentTime, 0.45, 0.2); }
+
+function play() {
+  if (playing) return stop();
+  const a = start, b = $('follow').checked ? measures.length - 1 : visible().at(-1);
+  const inRange = m => m >= a && m <= b;
+  const spb = 60 / (+$('bpm').value || 90), solo = $('solo').value;
+  const t0 = audio().currentTime + 0.1, base = measures[a].at;
+  const total = measures[b].at + measures[b].len - base;
+  const oscs = [];
+  for (const n of notes) {
+    if (n.rest || !inRange(n.m) || (n.tiePrev && inRange(n.tiePrev.m))) continue;
+    const d = tieGroup(n).slice(tieGroup(n).indexOf(n)).reduce((s, o) => s + o.dur, 0);
+    const gain = solo ? (n.part === solo ? 0.25 : 0.035) : n.part === 'Piano' ? 0.05 : 0.12;
+    oscs.push(tone(midiOf(n), t0 + (n.abs - base) * spb, Math.max(0.05, d * spb), gain, n.part === 'Piano' ? 'sine' : 'triangle'));
+  }
+  playing = {oscs, t0, spb, base, total};
+  $('play').textContent = 'Stop';
+  requestAnimationFrame(tick);
+}
+
+function stop() {
+  if (!playing) return;
+  for (const o of playing.oscs) try { o.stop(); } catch {}
+  playing = null;
+  $('play').textContent = 'Play';
+  const ph = document.getElementById('playhead');
+  if (ph) ph.setAttribute('visibility', 'hidden');
+}
+
+function tick() {
+  if (!playing) return;
+  const q = (audio().currentTime - playing.t0) / playing.spb;
+  if (q > playing.total) return stop();
+  const abs = playing.base + q, last = measures[layout.vis.at(-1)];
+  if (abs >= last.at + last.len && start + count < measures.length) {
+    start += count;  // turn the page without stopping playback
+    render();
+    return requestAnimationFrame(tick);
+  }
+  const ph = document.getElementById('playhead');
+  if (ph && q >= 0) {
+    let m = layout.vis.find(m => abs < measures[m].at + measures[m].len) ?? layout.vis.at(-1);
+    const x = layout.xAt(m, abs - measures[m].at);
+    ph.setAttribute('x1', x); ph.setAttribute('x2', x); ph.setAttribute('visibility', 'visible');
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---------- scan ----------
+let scanPage = 0;
+function syncScan() {
+  if ($('scan').hidden) return;
+  const page = measures[start].page;
+  if (page !== scanPage) { scanPage = page; $('scan').src = `scan.pdf?p=${page}#page=${page}&navpanes=0`; }
+}
+
+// ---------- input ----------
+function go(i) {
+  stop();
+  start = Math.max(0, Math.min(measures.length - 1, i));
+  render();
+}
+
+$('score').addEventListener('pointerdown', e => {
+  const gap = e.target.closest('[data-gap]');
+  if (gap) {
+    e.preventDefault();
+    if (!editing) { sel = null; render(); return showStatus('Empty gap the scan reader left. Press E, then click it to add a note.'); }
+    sel = fillGap(gaps[+gap.dataset.gap]);
+    if (sel) { beep(sel); drag = {n: sel, y: e.clientY, dp: dpOf(sel), recorded: true}; }
+    render();
+    if (sel) showStatus(`Added ${noteName(sel)} ${sel.type}${'.'.repeat(sel.dots)} — drag or ↑↓ to set the pitch.`);
+    return;
+  }
+  const g = e.target.closest('[data-i]');
+  sel = g ? notes[+g.dataset.i] : null;
+  if (sel) {
+    beep(sel);
+    if (editing && !sel.rest) drag = {n: sel, y: e.clientY, dp: dpOf(sel), recorded: false};
+    e.preventDefault();
+  }
+  render();
+});
+window.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const svg = $('score').querySelector('svg');
+  const ratio = svg.getBoundingClientRect().width / svg.viewBox.baseVal.width;
+  const dp = drag.dp + Math.round((drag.y - e.clientY) / ratio / HS);
+  if (dp === dpOf(drag.n)) return;
+  change(drag.n, diatonic(drag.n, dp), !drag.recorded);
+  drag.recorded = true;
+});
+window.addEventListener('pointerup', () => { drag = null; });
+
+function cycle(dir) {
+  const vis = visible();
+  const list = notes.filter(n => vis.includes(n.m) && !n.rest)
+    .sort((a, b) => a.row.idx - b.row.idx || a.abs - b.abs || midiOf(b) - midiOf(a));
+  if (!list.length) return;
+  const k = list.indexOf(sel);
+  sel = list[(k < 0 ? (dir > 0 ? 0 : -1) : k + dir + list.length) % list.length] ?? list.at(-1);
+  beep(sel);
+  render();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') {
+    if (e.key === 'Enter' && e.target.id === 'bar') {
+      const i = measures.findIndex(m => m.number === e.target.value.trim());
+      if (i >= 0) go(i);
+      e.target.blur();
+    }
+    return;
+  }
+  const cmd = e.metaKey || e.ctrlKey;
+  if (cmd && e.key === 's') { e.preventDefault(); save(); return; }
+  if (cmd && e.key === 'z') { e.preventDefault(); undo(); return; }
+  if (cmd || e.altKey) return;
+  const k = e.key;
+  if (k === 'ArrowLeft' || k === 'ArrowRight') go(start + (k === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? count : 1));
+  else if ((k === 'ArrowUp' || k === 'ArrowDown') && editing && sel && !sel.rest) {
+    const d = k === 'ArrowUp' ? 1 : -1;
+    change(sel, e.shiftKey ? chromatic(sel, d) : diatonic(sel, dpOf(sel) + d));
+  }
+  else if (k === 'e' || k === 'E') { editing = !editing; render(); }
+  else if (k === 'f' || k === 'F') $('follow').checked = !$('follow').checked;
+  else if (k === '1' || k === '2' || k === '3') { count = +k; $('count').value = k; render(); }
+  else if (k === ' ') play();
+  else if (k === 'Tab') cycle(e.shiftKey ? -1 : 1);
+  else if (k === 'Escape') { sel = null; render(); }
+  else return;
+  e.preventDefault();
+});
+
+$('prev').onclick = () => go(start - 1);
+$('next').onclick = () => go(start + 1);
+$('count').onchange = e => { count = +e.target.value; e.target.blur(); render(); };
+$('follow').onchange = e => e.target.blur();
+$('play').onclick = e => { e.target.blur(); play(); };
+$('edit').onclick = e => { e.target.blur(); editing = !editing; render(); };
+$('undo').onclick = e => { e.target.blur(); undo(); };
+$('save').onclick = e => { e.target.blur(); save(); };
+$('scanBtn').onclick = e => {
+  e.target.blur();
+  $('scan').hidden = !$('scan').hidden;
+  e.target.classList.toggle('on', !$('scan').hidden);
+  scanPage = 0; render();
+};
+function setHdr() { document.documentElement.style.setProperty('--hdr', document.querySelector('header').offsetHeight + 'px'); }
+window.addEventListener('resize', () => { setHdr(); render(); });
+window.addEventListener('beforeunload', e => { if (dirty) e.preventDefault(); });
+
+(async () => {
+  const meta = await (await fetch('meta')).json();
+  $('title').textContent = meta.title;
+  document.title = meta.title;
+  $('scanBtn').hidden = !meta.scan;
+  $('scan').hidden = !meta.scan;
+  $('scanBtn').classList.toggle('on', meta.scan);
+  setHdr();
+  doc = new DOMParser().parseFromString(await (await fetch('score.musicxml')).text(), 'application/xml');
+  build();
+  render();
+})();
+</script>
+</body>
+</html>

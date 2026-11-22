@@ -1,0 +1,10 @@
+# Local score data and generated rehearsal tracks
+/scans/
+/out/
+
+# Local tooling and caches
+/.venv/
+/.playwright-mcp/
+__pycache__/
+*.py[cod]
+.DS_Store
